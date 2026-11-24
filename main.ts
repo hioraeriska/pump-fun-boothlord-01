@@ -37,7 +37,13 @@ import { createInterface } from "node:readline";
 const BUY_LAMPORTS = 20_000_000n; // 0.02 SOL per entry
 const MIN_REAL_RESERVES = 2_500_000_000n; // 2.5 SOL
 const MIN_TRADES_TO_ENTER = 2; // need the create + a couple of trades seen
-const MAX_SLIPPAGE_BPS_BUY = 1000; // 10%: fills must survive fast surges
+const MAX_SLIPPAGE_BPS_BUY = 150; // 1.5%: buys must fill near the decision
+// price. The harness rejects a fill worse than the band, and rejections
+// are free — so a tight band is a filter, not a cost: it refuses to chase
+// a burst that ran away in the 2-slot latency, and only fills when the
+// price is calm or dipping into the order. (v5 forensics: fills ran ~5-10%
+// above decision on surging coins, so 88% of entries never peaked +5%
+// above their fill price. Wide buy slippage was the adverse selection.)
 const MAX_SLIPPAGE_BPS_SELL = 2000; // 20%: exits must fill through crashes
 const TAKE_PROFIT_NUM = 135n; // exit at +35%
 const STOP_LOSS_NUM = 88n; // exit at -12%
@@ -320,7 +326,7 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
             if (f.reason === "not_in_universe" || f.reason === "token_complete" || f.reason === "max_order_size" || f.reason === "zero_amount") {
               blocked.add(mint);
             } else {
-              blockedUntil.set(mint, slot + 100);
+              blockedUntil.set(mint, slot + 200);
             }
           }
           pendingBuys.delete(f.client_id);
