@@ -10,12 +10,14 @@
 // waiting for a rise buys the top and loses, while the early coins are
 // where the surge is — then exit fast on a take-profit, a stop-loss, a
 // trailing stop, or a time cap. At most 5 open positions, one round trip
-// per mint, and a mint whose buy fails for a permanent reason is never
-// retried (a transient slippage reject only cools it down briefly). Buys
-// tolerate 10% slippage, sells 20%, because the harness rejects an order
-// whose fill moved past its slippage band in the 2-slot latency — and a
-// rejected exit during a crash is how a -10% trailing stop becomes a
-// -50% loss.
+// per mint, and never two buys on the same mint at once: a second buy
+// would overwrite the tracked position while the engine keeps both lots,
+// stranding tokens no exit can ever sell (that bug cost v4 its whole run:
+// 19 positions stuck open, 184k max_open_positions rejections). A mint
+// whose buy fails for a permanent reason is never retried (a transient
+// slippage reject only cools it down briefly). Buys tolerate 10%
+// slippage, sells 20%, because the harness rejects an order whose fill
+// moved past its slippage band in the 2-slot latency.
 //
 // All price comparisons use BigInt cross-multiplication on the bonding
 // curve reserves (price = virtual SOL reserves / virtual token reserves),
@@ -97,6 +99,7 @@ function priceGt(a: Price, b: Price): boolean {
 const coins = new Map<string, Coin>();
 const positions = new Map<string, Position>();
 const pendingBuys = new Map<string, string>(); // client_id -> mint
+const pendingBuyMints = new Set<string>(); // mints with a buy already in flight
 const pendingSells = new Set<string>(); // mints with a sell already in flight
 const blocked = new Set<string>(); // mints whose buy failed permanently: never retry
 const blockedUntil = new Map<string, number>(); // mint -> slot: cooldown after a transient buy reject
@@ -178,7 +181,7 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
     for (const mint of candidates) {
       if (buysPlaced >= MAX_BUYS_PER_BATCH) break;
       if (positions.size + pendingBuys.size >= maxOpen) break;
-      if (positions.has(mint) || traded.has(mint) || blocked.has(mint)) continue;
+      if (positions.has(mint) || pendingBuyMints.has(mint) || traded.has(mint) || blocked.has(mint)) continue;
       const cool = blockedUntil.get(mint);
       if (cool !== undefined && currentSlot < cool) continue;
       const c = coins.get(mint);
@@ -195,6 +198,7 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
         })
       ) {
         pendingBuys.set(orders[orders.length - 1].client_id, mint);
+        pendingBuyMints.add(mint);
         buysPlaced += 1;
       }
     }
@@ -242,8 +246,7 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
           }
         }
         if (typeof e.real_sol_reserves === "string") {
-          const r = BigInt(e.real_sol_reserves);
-          if (r > c.realSol) c.realSol = r;
+          c.realSol = BigInt(e.real_sol_reserves);
         }
         c.trades += 1;
         if (e.is_buy === true) c.buys += 1;
@@ -266,8 +269,7 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
         if (!c.first) c.first = { n, d };
       }
       if (typeof m.real_quote_reserves === "string") {
-        const r = BigInt(m.real_quote_reserves);
-        if (r > c.realSol) c.realSol = r;
+        c.realSol = BigInt(m.real_quote_reserves);
       }
     }
   }
@@ -280,23 +282,38 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
       if (f.status === "filled" && f.side === "buy" && typeof f.client_id === "string") {
         const mint = pendingBuys.get(f.client_id);
         pendingBuys.delete(f.client_id);
+        if (mint) pendingBuyMints.delete(mint);
         if (mint && typeof f.mint === "string") {
           const tokens = BigInt(f.token_amount ?? "0");
           const quote = BigInt(f.quote_lamports ?? "0");
           if (tokens > 0n && quote > 0n) {
             const entry: Price = { n: quote, d: tokens };
-            positions.set(mint, { tokens, entry, peak: entry, entrySlot: slot });
+            const existing = positions.get(mint);
+            if (existing) {
+              // Top-up, never overwrite: keep the first entry, add tokens.
+              existing.tokens += tokens;
+            } else {
+              positions.set(mint, { tokens, entry, peak: entry, entrySlot: slot });
+            }
           }
         }
       } else if (f.status === "filled" && f.side === "sell") {
         if (typeof f.mint === "string") {
-          positions.delete(f.mint);
           pendingSells.delete(f.mint);
+          // Do not delete the position here: the account snapshot below
+          // is the source of truth. If tokens remain, the position stays.
+          const pos = positions.get(f.mint);
+          if (pos) {
+            const sold = BigInt(f.token_amount ?? "0");
+            pos.tokens -= sold;
+            if (pos.tokens <= 0n) positions.delete(f.mint);
+          }
         }
       } else if (f.status === "rejected" || f.status === "failed") {
         if (typeof f.client_id === "string") {
           const mint = pendingBuys.get(f.client_id);
           if (mint) {
+            pendingBuyMints.delete(mint);
             // Permanent reasons: the mint is not tradeable at our size.
             // Transient ones (max_slippage, insufficient_cash, failed):
             // cool down briefly, then the mint may qualify again.
