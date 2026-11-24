@@ -4,12 +4,12 @@
 // one batch per slot window, then done. We answer every batch with one
 // reply echoing its seq and carrying our orders for that batch.
 //
-// Idea, in one line: buy a coin as soon as it is big enough to take a
-// 0.02 SOL order (real reserves >= 2.5 SOL, so the order is 0.8% of
-// reserves, under the 1% cap) — no momentum filter, because on this data
-// waiting for a rise buys the top and loses, while the early coins are
-// where the surge is — then exit patiently: take profit +35%, stop loss
-// -15%, trailing stop -15% from the peak, or a ~50-minute time cap. The
+// Idea, in one line: buy a coin only once it is established (real
+// reserves >= 12 SOL, so the 0.02 SOL order is 0.17% of reserves, far
+// under the 1% cap) — small fresh coins are almost all burst-and-rug and
+// lose ~20% in the hour after entry whatever the exit rule, while big
+// coins move slower, run further, and reach +35% after entry far more
+// often — then exit patiently: take profit +35%, stop loss -15%,
 // post-entry dip is normal (the price typically falls ~10% within a few
 // slots of entry, then recovers: 48% of entries reach +10% again after
 // the exit point, 29% reach +35%). Tight stops sell the dip; the exits
@@ -39,7 +39,13 @@ import { createInterface } from "node:readline";
 // work: take profit +35%, stop loss -12%, trailing stop -10% from the peak,
 // or a ~13-minute time cap so slots keep turning over.
 const BUY_LAMPORTS = 20_000_000n; // 0.02 SOL per entry
-const MIN_REAL_RESERVES = 2_500_000_000n; // 2.5 SOL
+// Enter only once a coin is ESTABLISHED: real reserves >= 12 SOL. Small
+// fresh coins (real 2.5 SOL) are almost all burst-and-rug: they lose ~20%
+// in the hour after entry whatever the exit rule. Big coins move slower
+// (less fill bias in the 2-slot latency), run further, and reach +35%
+// after entry far more often (45% vs 12% for small coins). A 0.02 SOL
+// order is 0.17% of 12 SOL of reserves, far under the 1% cap.
+const MIN_REAL_RESERVES = 12_000_000_000n; // 12 SOL
 const MIN_TRADES_TO_ENTER = 2; // need the create + a couple of trades seen
 const MAX_SLIPPAGE_BPS_BUY = 150; // 1.5%: buys must fill near the decision
 // price. The harness rejects a fill worse than the band, and rejections
