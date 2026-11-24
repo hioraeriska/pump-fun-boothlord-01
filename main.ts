@@ -1,19 +1,21 @@
-// pump-fun-boothlord-01 — disciplined early-momentum paper trader.
+// pump-fun-boothlord-01 — disciplined early-buyer paper trader.
 //
 // Speaks agent-fun/replay/v2 over NDJSON: the harness sends a hello, then
 // one batch per slot window, then done. We answer every batch with one
 // reply echoing its seq and carrying our orders for that batch.
 //
-// Idea, in one line: buy a coin only after it has proven demand (price up
-// >=5% from first sight, buy-heavy flow, real reserves >= 1.5 SOL, sized at
-// 0.8% of real reserves so the order stays under the 1%-of-reserve cap),
-// then exit fast on a take-profit, a stop-loss, a trailing stop, or a time
-// cap. At most 5 open positions, one round trip per mint, and a mint
-// whose buy fails for a permanent reason is never retried (a transient
-// slippage reject only cools it down briefly). Buys tolerate 10%
-// slippage, sells 20%, because the harness rejects an order whose fill
-// moved past its slippage band in the 2-slot latency — and a rejected
-// exit during a crash is how a -8% trailing stop becomes a -50% loss.
+// Idea, in one line: buy a coin as soon as it is big enough to take a
+// 0.02 SOL order (real reserves >= 2.5 SOL, so the order is 0.8% of
+// reserves, under the 1% cap) — no momentum filter, because on this data
+// waiting for a rise buys the top and loses, while the early coins are
+// where the surge is — then exit fast on a take-profit, a stop-loss, a
+// trailing stop, or a time cap. At most 5 open positions, one round trip
+// per mint, and a mint whose buy fails for a permanent reason is never
+// retried (a transient slippage reject only cools it down briefly). Buys
+// tolerate 10% slippage, sells 20%, because the harness rejects an order
+// whose fill moved past its slippage band in the 2-slot latency — and a
+// rejected exit during a crash is how a -10% trailing stop becomes a
+// -50% loss.
 //
 // All price comparisons use BigInt cross-multiplication on the bonding
 // curve reserves (price = virtual SOL reserves / virtual token reserves),
@@ -22,22 +24,22 @@
 import { createInterface } from "node:readline";
 
 // ---- Tunables (lamports unless noted) ------------------------------------
-// Size scales with the coin's real reserves (0.8% of them) so the order
-// stays well under the 1%-of-reserve cap, floored above the 0.01 SOL bar
-// and capped to keep one loser small.
-const MIN_BUY_LAMPORTS = 12_000_000n; // 0.012 SOL
-const MAX_BUY_LAMPORTS = 100_000_000n; // 0.10 SOL
-const MIN_REAL_RESERVES = 1_500_000_000n; // 1.5 SOL
+// Fixed small size: 0.02 SOL per entry, twice the 0.01 SOL round-trip bar.
+// It needs real reserves >= 2.5 SOL (0.8% of reserves, under the 1% cap).
+// Shape (validated on the dev window: momentum entries lose, early entries
+// win): buy a coin as soon as it is big enough to take our order, with no
+// momentum filter — most coins pump hardest in their first minutes, and
+// waiting for a +5% confirmation systematically buys the top. Exits do the
+// work: take profit +35%, stop loss -12%, trailing stop -10% from the peak,
+// or a ~13-minute time cap so slots keep turning over.
+const BUY_LAMPORTS = 20_000_000n; // 0.02 SOL per entry
+const MIN_REAL_RESERVES = 2_500_000_000n; // 2.5 SOL
+const MIN_TRADES_TO_ENTER = 2; // need the create + a couple of trades seen
 const MAX_SLIPPAGE_BPS_BUY = 1000; // 10%: fills must survive fast surges
 const MAX_SLIPPAGE_BPS_SELL = 2000; // 20%: exits must fill through crashes
-const ENTRY_RISE_NUM = 105n; // enter at +5% vs first-seen price
-const ENTRY_RISE_DEN = 100n;
-const MIN_TRADES_TO_ENTER = 5; // need a little flow history first
-const MIN_BUY_SHARE_NUM = 3n; // at least 60% of observed trades are buys
-const MIN_BUY_SHARE_DEN = 5n;
-const TAKE_PROFIT_NUM = 120n; // exit at +20%
-const STOP_LOSS_NUM = 90n; // exit at -10%
-const TRAIL_NUM = 92n; // exit at -8% from the peak since entry
+const TAKE_PROFIT_NUM = 135n; // exit at +35%
+const STOP_LOSS_NUM = 88n; // exit at -12%
+const TRAIL_NUM = 90n; // exit at -10% from the peak since entry
 const MAX_HOLD_SLOTS = 3600; // ~13 min: free the slot, bank the round trip
 const MAX_BUYS_PER_BATCH = 5;
 
@@ -165,11 +167,13 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
     }
   }
 
-  // 2) Entries: proven demand, enough real reserves, a free slot, cash.
-  // Size is 0.8% of the coin's real reserves, floored above the bar.
+  // 2) Entries: buy early — as soon as the coin is big enough to take a
+  // 0.02 SOL order at 0.8% of its real reserves. No momentum filter: on
+  // this data, waiting for a rise buys the top and loses; the early coins
+  // are where the surge is. One trip per mint, a free slot, and cash.
   const openCount = positions.size + pendingBuys.size;
   let buysPlaced = 0;
-  if (openCount < maxOpen && cash >= MIN_BUY_LAMPORTS + 1_000_000n) {
+  if (openCount < maxOpen && cash >= BUY_LAMPORTS + 1_000_000n) {
     const candidates = [...coins.keys()].sort();
     for (const mint of candidates) {
       if (buysPlaced >= MAX_BUYS_PER_BATCH) break;
@@ -181,19 +185,12 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
       if (!c || !c.first || !c.cur) continue;
       if (c.trades < MIN_TRADES_TO_ENTER) continue;
       if (c.realSol < MIN_REAL_RESERVES) continue;
-      // Buy-heavy flow: buys / trades >= 60%.
-      if (BigInt(c.buys) * MIN_BUY_SHARE_DEN < BigInt(c.trades) * MIN_BUY_SHARE_NUM) continue;
-      // Momentum: current price >= first price * 1.05.
-      if (!priceAtLeast(c.cur, c.first, ENTRY_RISE_NUM, ENTRY_RISE_DEN)) continue;
-      const sized = (c.realSol * 80n) / 10000n; // 0.8% of real reserves
-      const quote = sized < MIN_BUY_LAMPORTS ? MIN_BUY_LAMPORTS : sized > MAX_BUY_LAMPORTS ? MAX_BUY_LAMPORTS : sized;
-      if (cash < quote + 1_000_000n) continue;
       if (
         push({
           side: "buy",
           client_id: nextClientId("b"),
           mint,
-          quote_lamports: quote.toString(),
+          quote_lamports: BUY_LAMPORTS.toString(),
           max_slippage_bps: MAX_SLIPPAGE_BPS_BUY,
         })
       ) {
