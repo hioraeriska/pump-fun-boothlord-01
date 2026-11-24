@@ -8,10 +8,12 @@
 // >=5% from first sight, buy-heavy flow, real reserves >= 1.5 SOL, sized at
 // 0.8% of real reserves so the order stays under the 1%-of-reserve cap),
 // then exit fast on a take-profit, a stop-loss, a trailing stop, or a time
-// cap. At most 5 open positions, one round trip per mint, and a mint whose
-// buy is ever rejected is never retried. Everything is decided from the
-// event stream alone: no randomness, no clock, no network, so two runs
-// produce byte-identical action logs.
+// cap. At most 5 open positions, one round trip per mint, and a mint
+// whose buy fails for a permanent reason is never retried (a transient
+// slippage reject only cools it down briefly). Buys tolerate 10%
+// slippage, sells 20%, because the harness rejects an order whose fill
+// moved past its slippage band in the 2-slot latency — and a rejected
+// exit during a crash is how a -8% trailing stop becomes a -50% loss.
 //
 // All price comparisons use BigInt cross-multiplication on the bonding
 // curve reserves (price = virtual SOL reserves / virtual token reserves),
@@ -26,7 +28,8 @@ import { createInterface } from "node:readline";
 const MIN_BUY_LAMPORTS = 12_000_000n; // 0.012 SOL
 const MAX_BUY_LAMPORTS = 100_000_000n; // 0.10 SOL
 const MIN_REAL_RESERVES = 1_500_000_000n; // 1.5 SOL
-const MAX_SLIPPAGE_BPS = 500; // 5%
+const MAX_SLIPPAGE_BPS_BUY = 1000; // 10%: fills must survive fast surges
+const MAX_SLIPPAGE_BPS_SELL = 2000; // 20%: exits must fill through crashes
 const ENTRY_RISE_NUM = 105n; // enter at +5% vs first-seen price
 const ENTRY_RISE_DEN = 100n;
 const MIN_TRADES_TO_ENTER = 5; // need a little flow history first
@@ -93,7 +96,8 @@ const coins = new Map<string, Coin>();
 const positions = new Map<string, Position>();
 const pendingBuys = new Map<string, string>(); // client_id -> mint
 const pendingSells = new Set<string>(); // mints with a sell already in flight
-const blocked = new Set<string>(); // mints whose buy was rejected: never retry
+const blocked = new Set<string>(); // mints whose buy failed permanently: never retry
+const blockedUntil = new Map<string, number>(); // mint -> slot: cooldown after a transient buy reject
 const traded = new Set<string>(); // mints already round-tripped: one trip each
 const accountTokens = new Map<string, bigint>(); // mint -> tokens per account
 let cash = 0n;
@@ -152,7 +156,7 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
           client_id: nextClientId("s"),
           mint,
           token_amount: tokens.toString(),
-          max_slippage_bps: MAX_SLIPPAGE_BPS,
+          max_slippage_bps: MAX_SLIPPAGE_BPS_SELL,
         })
       ) {
         pendingSells.add(mint);
@@ -171,9 +175,10 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
       if (buysPlaced >= MAX_BUYS_PER_BATCH) break;
       if (positions.size + pendingBuys.size >= maxOpen) break;
       if (positions.has(mint) || traded.has(mint) || blocked.has(mint)) continue;
+      const cool = blockedUntil.get(mint);
+      if (cool !== undefined && currentSlot < cool) continue;
       const c = coins.get(mint);
       if (!c || !c.first || !c.cur) continue;
-      if (!c.inMarks) continue; // only coins the harness itself marks
       if (c.trades < MIN_TRADES_TO_ENTER) continue;
       if (c.realSol < MIN_REAL_RESERVES) continue;
       // Buy-heavy flow: buys / trades >= 60%.
@@ -189,7 +194,7 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
           client_id: nextClientId("b"),
           mint,
           quote_lamports: quote.toString(),
-          max_slippage_bps: MAX_SLIPPAGE_BPS,
+          max_slippage_bps: MAX_SLIPPAGE_BPS_BUY,
         })
       ) {
         pendingBuys.set(orders[orders.length - 1].client_id, mint);
@@ -294,7 +299,16 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
       } else if (f.status === "rejected" || f.status === "failed") {
         if (typeof f.client_id === "string") {
           const mint = pendingBuys.get(f.client_id);
-          if (mint) blocked.add(mint);
+          if (mint) {
+            // Permanent reasons: the mint is not tradeable at our size.
+            // Transient ones (max_slippage, insufficient_cash, failed):
+            // cool down briefly, then the mint may qualify again.
+            if (f.reason === "not_in_universe" || f.reason === "token_complete" || f.reason === "max_order_size" || f.reason === "zero_amount") {
+              blocked.add(mint);
+            } else {
+              blockedUntil.set(mint, slot + 100);
+            }
+          }
           pendingBuys.delete(f.client_id);
         }
         if (f.side === "sell" && typeof f.mint === "string") {
