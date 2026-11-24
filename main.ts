@@ -5,12 +5,13 @@
 // reply echoing its seq and carrying our orders for that batch.
 //
 // Idea, in one line: buy a coin only after it has proven demand (price up
-// >=8% from first sight, buy-heavy flow, real reserves >= 2.5 SOL so a
-// 0.02 SOL order stays under the 1%-of-reserve cap), then exit fast on a
-// take-profit, a stop-loss, a trailing stop, or a time cap. Small fixed
-// size, at most 5 open positions, one round trip per mint. Everything is
-// decided from the event stream alone: no randomness, no clock, no network,
-// so two runs produce byte-identical action logs.
+// >=5% from first sight, buy-heavy flow, real reserves >= 1.5 SOL, sized at
+// 0.8% of real reserves so the order stays under the 1%-of-reserve cap),
+// then exit fast on a take-profit, a stop-loss, a trailing stop, or a time
+// cap. At most 5 open positions, one round trip per mint, and a mint whose
+// buy is ever rejected is never retried. Everything is decided from the
+// event stream alone: no randomness, no clock, no network, so two runs
+// produce byte-identical action logs.
 //
 // All price comparisons use BigInt cross-multiplication on the bonding
 // curve reserves (price = virtual SOL reserves / virtual token reserves),
@@ -19,19 +20,23 @@
 import { createInterface } from "node:readline";
 
 // ---- Tunables (lamports unless noted) ------------------------------------
-const BUY_LAMPORTS = 20_000_000n; // 0.02 SOL per entry: 2x the 0.01 SOL bar
-const MIN_REAL_RESERVES = 2_500_000_000n; // 2.5 SOL: 0.02 SOL is 0.8% of it
+// Size scales with the coin's real reserves (0.8% of them) so the order
+// stays well under the 1%-of-reserve cap, floored above the 0.01 SOL bar
+// and capped to keep one loser small.
+const MIN_BUY_LAMPORTS = 12_000_000n; // 0.012 SOL
+const MAX_BUY_LAMPORTS = 100_000_000n; // 0.10 SOL
+const MIN_REAL_RESERVES = 1_500_000_000n; // 1.5 SOL
 const MAX_SLIPPAGE_BPS = 500; // 5%
-const ENTRY_RISE_NUM = 108n; // enter at +8% vs first-seen price
+const ENTRY_RISE_NUM = 105n; // enter at +5% vs first-seen price
 const ENTRY_RISE_DEN = 100n;
-const MIN_TRADES_TO_ENTER = 6; // need a little flow history first
+const MIN_TRADES_TO_ENTER = 5; // need a little flow history first
 const MIN_BUY_SHARE_NUM = 3n; // at least 60% of observed trades are buys
 const MIN_BUY_SHARE_DEN = 5n;
-const TAKE_PROFIT_NUM = 135n; // exit at +35%
-const STOP_LOSS_NUM = 80n; // exit at -20%
-const TRAIL_NUM = 85n; // exit at -15% from the peak since entry
-const MAX_HOLD_SLOTS = 7200; // ~48 min: free the slot, bank the round trip
-const MAX_BUYS_PER_BATCH = 3;
+const TAKE_PROFIT_NUM = 120n; // exit at +20%
+const STOP_LOSS_NUM = 90n; // exit at -10%
+const TRAIL_NUM = 92n; // exit at -8% from the peak since entry
+const MAX_HOLD_SLOTS = 3600; // ~13 min: free the slot, bank the round trip
+const MAX_BUYS_PER_BATCH = 5;
 
 // ---- Types -----------------------------------------------------------------
 type Price = { n: bigint; d: bigint }; // n/d = lamports per token base unit
@@ -39,10 +44,12 @@ type Price = { n: bigint; d: bigint }; // n/d = lamports per token base unit
 type Coin = {
   first: Price | null; // price at first sight (create or first trade)
   cur: Price | null; // latest price from marks / events
+  curSlot: number; // slot of the data behind cur (marks win over events)
   realSol: bigint; // latest real SOL reserves
   trades: number;
   buys: number;
   seenSlot: number;
+  inMarks: boolean; // seen in a marks array: the harness tracks this mint
 };
 
 type Position = {
@@ -85,6 +92,8 @@ function priceGt(a: Price, b: Price): boolean {
 const coins = new Map<string, Coin>();
 const positions = new Map<string, Position>();
 const pendingBuys = new Map<string, string>(); // client_id -> mint
+const pendingSells = new Set<string>(); // mints with a sell already in flight
+const blocked = new Set<string>(); // mints whose buy was rejected: never retry
 const traded = new Set<string>(); // mints already round-tripped: one trip each
 const accountTokens = new Map<string, bigint>(); // mint -> tokens per account
 let cash = 0n;
@@ -96,7 +105,7 @@ let currentSlot = 0;
 function coinFor(mint: string, slot: number): Coin {
   let c = coins.get(mint);
   if (!c) {
-    c = { first: null, cur: null, realSol: 0n, trades: 0, buys: 0, seenSlot: slot };
+    c = { first: null, cur: null, curSlot: -1, realSol: 0n, trades: 0, buys: 0, seenSlot: slot, inMarks: false };
     coins.set(mint, c);
   }
   return c;
@@ -116,7 +125,8 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
     return true;
   };
 
-  // 1) Exits first: free slots before opening new ones.
+  // 1) Exits first: free slots before opening new ones. Never stack a
+  // second sell on a mint whose sell is already in flight.
   const mints = [...positions.keys()].sort();
   for (const mint of mints) {
     const pos = positions.get(mint);
@@ -124,6 +134,7 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
     const c = coins.get(mint);
     const cur = c?.cur;
     if (!cur) continue;
+    if (pendingSells.has(mint)) continue;
     const tokens = accountTokens.get(mint) ?? pos.tokens;
     if (tokens <= 0n) {
       positions.delete(mint);
@@ -144,35 +155,40 @@ function decide(seq: number): { type: "reply"; seq: number; orders: Order[] } {
           max_slippage_bps: MAX_SLIPPAGE_BPS,
         })
       ) {
+        pendingSells.add(mint);
         traded.add(mint);
       }
     }
   }
 
   // 2) Entries: proven demand, enough real reserves, a free slot, cash.
+  // Size is 0.8% of the coin's real reserves, floored above the bar.
   const openCount = positions.size + pendingBuys.size;
   let buysPlaced = 0;
-  if (openCount < maxOpen && cash >= BUY_LAMPORTS + 1_000_000n) {
+  if (openCount < maxOpen && cash >= MIN_BUY_LAMPORTS + 1_000_000n) {
     const candidates = [...coins.keys()].sort();
     for (const mint of candidates) {
       if (buysPlaced >= MAX_BUYS_PER_BATCH) break;
       if (positions.size + pendingBuys.size >= maxOpen) break;
-      if (cash < BUY_LAMPORTS + 1_000_000n) break;
-      if (positions.has(mint) || traded.has(mint)) continue;
+      if (positions.has(mint) || traded.has(mint) || blocked.has(mint)) continue;
       const c = coins.get(mint);
       if (!c || !c.first || !c.cur) continue;
+      if (!c.inMarks) continue; // only coins the harness itself marks
       if (c.trades < MIN_TRADES_TO_ENTER) continue;
       if (c.realSol < MIN_REAL_RESERVES) continue;
       // Buy-heavy flow: buys / trades >= 60%.
       if (BigInt(c.buys) * MIN_BUY_SHARE_DEN < BigInt(c.trades) * MIN_BUY_SHARE_NUM) continue;
-      // Momentum: current price >= first price * 1.08.
+      // Momentum: current price >= first price * 1.05.
       if (!priceAtLeast(c.cur, c.first, ENTRY_RISE_NUM, ENTRY_RISE_DEN)) continue;
+      const sized = (c.realSol * 80n) / 10000n; // 0.8% of real reserves
+      const quote = sized < MIN_BUY_LAMPORTS ? MIN_BUY_LAMPORTS : sized > MAX_BUY_LAMPORTS ? MAX_BUY_LAMPORTS : sized;
+      if (cash < quote + 1_000_000n) continue;
       if (
         push({
           side: "buy",
           client_id: nextClientId("b"),
           mint,
-          quote_lamports: BUY_LAMPORTS.toString(),
+          quote_lamports: quote.toString(),
           max_slippage_bps: MAX_SLIPPAGE_BPS,
         })
       ) {
@@ -199,40 +215,29 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
   currentSlot = slot;
   const seq = typeof msg.seq === "number" ? msg.seq : 0;
 
-  // Marks: freshest reserves per mint this batch.
-  if (Array.isArray(msg.marks)) {
-    for (const m of msg.marks) {
-      if (typeof m.mint !== "string") continue;
-      const c = coinFor(m.mint, slot);
-      const n = BigInt(m.virtual_quote_reserves ?? "0");
-      const d = BigInt(m.virtual_token_reserves ?? "0");
-      if (d > 0n) {
-        c.cur = { n, d };
-        if (!c.first) c.first = { n, d };
-      }
-      if (typeof m.real_quote_reserves === "string") {
-        const r = BigInt(m.real_quote_reserves);
-        if (r > c.realSol) c.realSol = r;
-      }
-    }
-  }
-
-  // Events: flow stats, first-seen prices, real reserves.
+  // Events first: flow stats, first-seen prices, real reserves.
   if (Array.isArray(msg.events)) {
     for (const e of msg.events) {
+      const eslot = typeof e.slot === "number" ? e.slot : slot;
       if (e.event === "CreateEvent" && typeof e.mint === "string") {
         const c = coinFor(e.mint, slot);
         const n = BigInt(e.virtual_sol_reserves ?? e.virtual_quote_reserves ?? "0");
         const d = BigInt(e.virtual_token_reserves ?? "0");
         if (d > 0n && !c.first) c.first = { n, d };
-        if (d > 0n) c.cur = { n, d };
+        if (d > 0n && eslot >= c.curSlot) {
+          c.cur = { n, d };
+          c.curSlot = eslot;
+        }
       } else if (e.event === "TradeEvent" && typeof e.mint === "string") {
         const c = coinFor(e.mint, slot);
         const n = BigInt(e.virtual_sol_reserves ?? "0");
         const d = BigInt(e.virtual_token_reserves ?? "0");
         if (d > 0n) {
           if (!c.first) c.first = { n, d };
-          c.cur = { n, d };
+          if (eslot >= c.curSlot) {
+            c.cur = { n, d };
+            c.curSlot = eslot;
+          }
         }
         if (typeof e.real_sol_reserves === "string") {
           const r = BigInt(e.real_sol_reserves);
@@ -244,7 +249,30 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
     }
   }
 
+  // Marks last: they are the freshest reserves per mint this batch.
+  if (Array.isArray(msg.marks)) {
+    for (const m of msg.marks) {
+      if (typeof m.mint !== "string") continue;
+      const c = coinFor(m.mint, slot);
+      c.inMarks = true;
+      const mslot = typeof m.slot === "number" ? m.slot : slot;
+      const n = BigInt(m.virtual_quote_reserves ?? "0");
+      const d = BigInt(m.virtual_token_reserves ?? "0");
+      if (d > 0n && mslot >= c.curSlot) {
+        c.cur = { n, d };
+        c.curSlot = mslot;
+        if (!c.first) c.first = { n, d };
+      }
+      if (typeof m.real_quote_reserves === "string") {
+        const r = BigInt(m.real_quote_reserves);
+        if (r > c.realSol) c.realSol = r;
+      }
+    }
+  }
+
   // Fills: confirm buys (fill-implied entry price), clear sells / rejects.
+  // A rejected buy blocks that mint for good: retrying it every batch
+  // only spams the log and the coin is not tradeable at our size anyway.
   if (Array.isArray(msg.fills)) {
     for (const f of msg.fills) {
       if (f.status === "filled" && f.side === "buy" && typeof f.client_id === "string") {
@@ -259,9 +287,20 @@ function onBatch(msg: any): { type: "reply"; seq: number; orders: Order[] } {
           }
         }
       } else if (f.status === "filled" && f.side === "sell") {
-        if (typeof f.mint === "string") positions.delete(f.mint);
+        if (typeof f.mint === "string") {
+          positions.delete(f.mint);
+          pendingSells.delete(f.mint);
+        }
       } else if (f.status === "rejected" || f.status === "failed") {
-        if (typeof f.client_id === "string") pendingBuys.delete(f.client_id);
+        if (typeof f.client_id === "string") {
+          const mint = pendingBuys.get(f.client_id);
+          if (mint) blocked.add(mint);
+          pendingBuys.delete(f.client_id);
+        }
+        if (f.side === "sell" && typeof f.mint === "string") {
+          // Sell rejected (e.g. amount raced): allow one retry next batch.
+          pendingSells.delete(f.mint);
+        }
       }
     }
   }
