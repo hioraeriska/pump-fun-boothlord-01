@@ -8,12 +8,12 @@
 // 0.02 SOL order (real reserves >= 2.5 SOL, so the order is 0.8% of
 // reserves, under the 1% cap) — no momentum filter, because on this data
 // waiting for a rise buys the top and loses, while the early coins are
-// where the surge is — then exit patiently: take profit +25%, stop loss
-// -25%, trailing stop -20% from the peak, or a ~50-minute time cap. The
+// where the surge is — then exit patiently: take profit +35%, stop loss
+// -15%, trailing stop -15% from the peak, or a ~50-minute time cap. The
 // post-entry dip is normal (the price typically falls ~10% within a few
 // slots of entry, then recovers: 48% of entries reach +10% again after
-// the exit point, 29% reach +35%). Tight stops sell the dip; wide stops
-// survive it to reach the bounce. At most 5 open positions, one round
+// the exit point, 29% reach +35%). Tight stops sell the dip; the exits
+// must survive it to reach the bounce. At most 5 open positions, one round
 // per mint, and never two buys on the same mint at once: a second buy
 // would overwrite the tracked position while the engine keeps both lots,
 // stranding tokens no exit can ever sell (that bug cost v4 its whole run:
@@ -49,12 +49,10 @@ const MAX_SLIPPAGE_BPS_BUY = 150; // 1.5%: buys must fill near the decision
 // above decision on surging coins, so 88% of entries never peaked +5%
 // above their fill price. Wide buy slippage was the adverse selection.)
 const MAX_SLIPPAGE_BPS_SELL = 2000; // 20%: exits must fill through crashes
-const TAKE_PROFIT_NUM = 125n; // exit at +25%
-const STOP_LOSS_NUM = 75n; // exit at -25%: room to dip and recover
-const TRAIL_NUM = 80n; // exit at -20% from the peak since entry
-const MAX_HOLD_SLOTS = 14400; // ~50 min: the recovery takes time; the
-// post-entry dip is normal (-10% within a few slots) and selling it is
-// how v5/v6 lost. Exits must survive the dip to reach the bounce.
+const TAKE_PROFIT_NUM = 135n; // exit at +35%
+const STOP_LOSS_NUM = 85n; // exit at -15%: room for the normal post-entry dip
+const TRAIL_NUM = 85n; // exit at -15% from the peak since entry
+const MAX_HOLD_SLOTS = 14400; // ~50 min: let the bounce arrive
 const MAX_BUYS_PER_BATCH = 5;
 
 // ---- Types -----------------------------------------------------------------
@@ -96,12 +94,16 @@ type Order =
 
 // ---- Small integer helpers -------------------------------------------------
 // Is price a/b >= k (k given as num/den)? Cross-multiply, no floats.
+// p/ref >= num/den  <=>  p.n * ref.d * den >= ref.n * p.d * num.
+// (An earlier version had num/den swapped here, which made every exit
+// fire at once: TP at >=74%, SL at <=114% — positions sold the batch
+// after entry, at ~breakeven minus fees. Fixed in v8.)
 function priceAtLeast(p: Price, ref: Price, num: bigint, den: bigint): boolean {
-  return p.n * ref.d * num >= ref.n * p.d * den;
+  return p.n * ref.d * den >= ref.n * p.d * num;
 }
 // Is price a/b <= k?
 function priceAtMost(p: Price, ref: Price, num: bigint, den: bigint): boolean {
-  return p.n * ref.d * num <= ref.n * p.d * den;
+  return p.n * ref.d * den <= ref.n * p.d * num;
 }
 function priceGt(a: Price, b: Price): boolean {
   return a.n * b.d > b.n * a.d;
