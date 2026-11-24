@@ -8,8 +8,12 @@
 // 0.02 SOL order (real reserves >= 2.5 SOL, so the order is 0.8% of
 // reserves, under the 1% cap) — no momentum filter, because on this data
 // waiting for a rise buys the top and loses, while the early coins are
-// where the surge is — then exit fast on a take-profit, a stop-loss, a
-// trailing stop, or a time cap. At most 5 open positions, one round trip
+// where the surge is — then exit patiently: take profit +25%, stop loss
+// -25%, trailing stop -20% from the peak, or a ~50-minute time cap. The
+// post-entry dip is normal (the price typically falls ~10% within a few
+// slots of entry, then recovers: 48% of entries reach +10% again after
+// the exit point, 29% reach +35%). Tight stops sell the dip; wide stops
+// survive it to reach the bounce. At most 5 open positions, one round
 // per mint, and never two buys on the same mint at once: a second buy
 // would overwrite the tracked position while the engine keeps both lots,
 // stranding tokens no exit can ever sell (that bug cost v4 its whole run:
@@ -45,10 +49,12 @@ const MAX_SLIPPAGE_BPS_BUY = 150; // 1.5%: buys must fill near the decision
 // above decision on surging coins, so 88% of entries never peaked +5%
 // above their fill price. Wide buy slippage was the adverse selection.)
 const MAX_SLIPPAGE_BPS_SELL = 2000; // 20%: exits must fill through crashes
-const TAKE_PROFIT_NUM = 135n; // exit at +35%
-const STOP_LOSS_NUM = 88n; // exit at -12%
-const TRAIL_NUM = 90n; // exit at -10% from the peak since entry
-const MAX_HOLD_SLOTS = 3600; // ~13 min: free the slot, bank the round trip
+const TAKE_PROFIT_NUM = 125n; // exit at +25%
+const STOP_LOSS_NUM = 75n; // exit at -25%: room to dip and recover
+const TRAIL_NUM = 80n; // exit at -20% from the peak since entry
+const MAX_HOLD_SLOTS = 14400; // ~50 min: the recovery takes time; the
+// post-entry dip is normal (-10% within a few slots) and selling it is
+// how v5/v6 lost. Exits must survive the dip to reach the bounce.
 const MAX_BUYS_PER_BATCH = 5;
 
 // ---- Types -----------------------------------------------------------------
